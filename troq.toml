@@ -1,0 +1,3 @@
+addons = ["postgres"]
+app = "node-hello-cf23-5d14"
+environment = "prod"
