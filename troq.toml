@@ -1,3 +1,4 @@
-addons = ["postgres"]
-app = "node-hello-cf23-5d14"
+addons = ["redis"]
+app = "node-hello-3e0f-e5a5"
 environment = "prod"
+workspace = "457f0998-37b8-468e-877e-83d401c7b047"

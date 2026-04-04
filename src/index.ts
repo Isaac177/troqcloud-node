@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express, { Request, Response } from "express";
 import { prisma } from "./lib/prisma";
+import { redis, REDIS_URL, testRedisConnection } from "./lib/redis";
 
 const app = express();
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
@@ -50,11 +51,13 @@ app.get("/", (_req: Request, res: Response) => {
 
 app.get("/about", async (_req: Request, res: Response) => {
   const databaseReachable = await testDatabaseConnection();
+  const redisReachable = await testRedisConnection();
   res.json({
     service: SERVICE_NAME,
     version: SERVICE_VERSION,
     orm: "Prisma",
     databaseReachable,
+    redisReachable,
   });
 });
 
@@ -64,9 +67,12 @@ app.get("/health", (_req: Request, res: Response) => {
 
 app.get("/ready", async (_req: Request, res: Response) => {
   const databaseReachable = await testDatabaseConnection();
-  res.status(databaseReachable ? 200 : 503).json({
-    status: databaseReachable ? "ok" : "degraded",
+  const redisReachable = await testRedisConnection();
+  const ready = databaseReachable && redisReachable;
+  res.status(ready ? 200 : 503).json({
+    status: ready ? "ok" : "degraded",
     databaseReachable,
+    redisReachable,
   });
 });
 
@@ -110,16 +116,91 @@ app.post("/users", async (req: Request, res: Response) => {
   }
 });
 
+app.get("/redis/ping", async (_req: Request, res: Response) => {
+  const pong = await redis.ping();
+  res.type("text/plain").send(pong);
+});
+
+app.get("/redis/:key", async (req: Request, res: Response) => {
+  const key = req.params.key.trim();
+  if (!key) {
+    res.status(400).json({ error: "key is required" });
+    return;
+  }
+
+  const value = await redis.get(key);
+  if (value === null) {
+    res.status(404).json({ error: "key not found", key });
+    return;
+  }
+
+  res.json({ key, value });
+});
+
+app.post("/redis/:key", async (req: Request, res: Response) => {
+  const key = req.params.key.trim();
+  const { value, ttlSeconds } = req.body as { value?: unknown; ttlSeconds?: unknown };
+  if (!key) {
+    res.status(400).json({ error: "key is required" });
+    return;
+  }
+  if (value === undefined || value === null) {
+    res.status(400).json({ error: "value is required" });
+    return;
+  }
+
+  const stringValue = typeof value === "string" ? value : JSON.stringify(value);
+  const ttl =
+    typeof ttlSeconds === "number" && Number.isInteger(ttlSeconds) && ttlSeconds > 0
+      ? ttlSeconds
+      : undefined;
+
+  if (ttl) {
+    await redis.set(key, stringValue, { EX: ttl });
+  } else {
+    await redis.set(key, stringValue);
+  }
+
+  res.status(201).json({ key, value: stringValue, ttlSeconds: ttl ?? null });
+});
+
+app.post("/redis/incr/:key", async (req: Request, res: Response) => {
+  const key = req.params.key.trim();
+  if (!key) {
+    res.status(400).json({ error: "key is required" });
+    return;
+  }
+
+  const value = await redis.incr(key);
+  res.json({ key, value });
+});
+
+app.delete("/redis/:key", async (req: Request, res: Response) => {
+  const key = req.params.key.trim();
+  if (!key) {
+    res.status(400).json({ error: "key is required" });
+    return;
+  }
+
+  const deleted = await redis.del(key);
+  res.json({ key, deleted: deleted === 1 });
+});
+
 async function start(): Promise<void> {
   const dbHost = new URL(DATABASE_URL).host;
   const dbProtocol = new URL(DATABASE_URL).protocol.replace(":", "");
+  const redisTarget = new URL(REDIS_URL).host;
   console.log(`[startup] service=${SERVICE_NAME} version=${SERVICE_VERSION}`);
   console.log(`[startup] port=${PORT}`);
   console.log(`[startup] orm=prisma`);
   console.log(`[startup] database protocol=${dbProtocol} host=${dbHost}`);
+  console.log(`[startup] redis host=${redisTarget}`);
 
   await prisma.$connect();
   console.log("[startup] prisma connected successfully");
+
+  await redis.connect();
+  console.log("[startup] redis connected successfully");
 
   await bootstrapDatabase();
   console.log(`[startup] seeded ${seedUsers.length} users`);
@@ -131,12 +212,15 @@ async function start(): Promise<void> {
 
 void start().catch(async (error: unknown) => {
   console.error("[startup] failed to start app", error);
+  await redis.disconnect().catch(() => undefined);
   await prisma.$disconnect();
   process.exit(1);
 });
 
 async function shutdown(signal: string): Promise<void> {
   console.log(`[shutdown] received ${signal}`);
+  await redis.disconnect();
+  console.log("[shutdown] redis disconnected");
   await prisma.$disconnect();
   console.log("[shutdown] prisma disconnected");
   process.exit(0);
